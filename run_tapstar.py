@@ -26,6 +26,7 @@ def main():
     root = Path(__file__).resolve().parent
     python_bin = sys.executable
 
+    descriptor_path = root / args.descriptor_path
     residual_ckpt = root / args.output_root / args.source_city / "tapr_pretrain" / "tapr_pretrain_best.pt"
     source_ckpt = root / args.output_root / args.source_city / "tapstar_pretrain" / "tapstar_source_best.pt"
     final_metrics_path = (
@@ -35,6 +36,23 @@ def main():
         / "finetune"
         / "final_metrics.json"
     )
+
+    if not descriptor_path.exists():
+        run_command(
+            [
+                python_bin,
+                "compute_city_descriptors.py",
+                "--source_city",
+                args.source_city,
+                "--target_city",
+                args.target_city,
+                "--data_root",
+                args.data_root,
+                "--out_path",
+                args.descriptor_path,
+            ],
+            root,
+        )
 
     run_command(
         [
