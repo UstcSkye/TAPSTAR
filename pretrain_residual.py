@@ -27,6 +27,13 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--mask_ratio", type=float, default=0.5)
     parser.add_argument("--node_mask_ratio", type=float, default=0.2)
+    parser.add_argument("--lambda_rec0", type=float, default=1.0)
+    parser.add_argument("--lambda_pred_max", type=float, default=1.0)
+    parser.add_argument("--pred_warmup_epochs", type=int, default=30)
+    parser.add_argument("--pred_ramp_epochs", type=int, default=0)
+    parser.add_argument("--lambda_cons", type=float, default=0.1)
+    parser.add_argument("--lambda_balance", type=float, default=0.001)
+    parser.add_argument("--lambda_entropy", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="auto")
     return parser.parse_args()
@@ -50,6 +57,18 @@ def build_city_desc(city: str, descriptor_path: str, device: torch.device):
     return desc, city_to_idx[city], desc_table.shape[1]
 
 
+def get_pred_weight(epoch: int, args) -> float:
+    warmup = max(0, int(args.pred_warmup_epochs))
+    ramp = max(0, int(args.pred_ramp_epochs))
+    if epoch <= warmup:
+        scale = 0.0
+    elif ramp > 0:
+        scale = min(1.0, float(epoch - warmup) / float(ramp))
+    else:
+        scale = 1.0
+    return float(args.lambda_pred_max) * scale
+
+
 def apply_mask_token(x: torch.Tensor, mask: torch.Tensor, mask_token: torch.Tensor) -> torch.Tensor:
     masked = x.clone()
     mask_f = mask.float()
@@ -68,10 +87,107 @@ def sample_mask(x: torch.Tensor, mask_ratio: float, node_mask_ratio: float) -> t
         device=x.device,
     )
     if node_mask_ratio > 0:
-        node_mask = (torch.rand((x.shape[0], x.shape[2]), device=x.device) < node_mask_ratio)
+        node_mask = torch.rand((x.shape[0], x.shape[2]), device=x.device) < node_mask_ratio
         node_mask = node_mask[:, None, :].expand(x.shape[0], x.shape[1], x.shape[2])
-        return temporal_mask | node_mask
+        temporal_mask = temporal_mask | node_mask
     return temporal_mask
+
+
+def aggregate_prototype_tokens(z: torch.Tensor, assignment: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    num = torch.einsum("bhtkn,btnd->bhkd", assignment, z)
+    den = assignment.sum(dim=(2, 4))
+    tokens = num / (den.unsqueeze(-1) + eps)
+    return tokens.mean(dim=1)
+
+
+def prototype_usage_regularizer(assignment: torch.Tensor, eps: float = 1e-6):
+    usage = assignment.mean(dim=(0, 2, 4)).mean(dim=0)
+    target = torch.full_like(usage, 1.0 / usage.numel())
+    balance = ((usage - target) ** 2).mean()
+    probs = assignment.permute(0, 1, 2, 4, 3)
+    entropy = -(probs * (probs + eps).log()).sum(dim=-1).mean()
+    return balance, entropy, usage.min(), usage.max()
+
+
+def evaluate(model, loader, city_desc_table, device, args):
+    loss_fn = torch.nn.SmoothL1Loss(reduction="none")
+    pred_loss_fn = torch.nn.L1Loss()
+    model.eval()
+
+    total = {
+        "res": 0.0,
+        "rec0": 0.0,
+        "pred": 0.0,
+        "cons": 0.0,
+        "balance": 0.0,
+        "entropy": 0.0,
+        "total": 0.0,
+        "steps": 0,
+    }
+
+    with torch.no_grad():
+        for x, y, _, city_ids in loader:
+            x = x.to(device)
+            y = y.to(device)
+            city_desc = city_desc_table[city_ids.to(device)]
+            pred_weight = get_pred_weight(args.current_epoch, args)
+
+            mask1 = sample_mask(x, args.mask_ratio, args.node_mask_ratio)
+            mask2 = sample_mask(x, args.mask_ratio, args.node_mask_ratio)
+            mask_f = mask1.float()
+
+            x_masked = apply_mask_token(x, mask1, model.base.mask_token)
+            coarse, delta_hat, _, z1, assignment1 = model(
+                x_masked,
+                mae_mask=mask1,
+                city_desc=city_desc,
+                return_assignment=True,
+            )
+            gt_speed = x[..., 0]
+            delta_target = gt_speed - coarse.detach()
+
+            res_loss = (loss_fn(delta_hat, delta_target) * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+            rec0_loss = (loss_fn(coarse, gt_speed) * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+
+            pred_loss = torch.zeros((), device=device)
+            if pred_weight > 0.0:
+                _, _, pred = model.base(x)
+                pred_loss = pred_loss_fn(pred, y) * pred_weight
+
+            x_masked2 = apply_mask_token(x, mask2, model.base.mask_token)
+            _, _, _, z2, assignment2 = model(
+                x_masked2,
+                mae_mask=mask2,
+                city_desc=city_desc,
+                return_assignment=True,
+            )
+            c1 = aggregate_prototype_tokens(z1, assignment1)
+            c2 = aggregate_prototype_tokens(z2, assignment2)
+            c1 = c1 / (c1.norm(dim=-1, keepdim=True) + 1e-6)
+            c2 = c2 / (c2.norm(dim=-1, keepdim=True) + 1e-6)
+            cons_loss = (1.0 - (c1 * c2).sum(dim=-1)).mean()
+
+            balance_loss, entropy_loss, _, _ = prototype_usage_regularizer(assignment1)
+            loss = (
+                res_loss
+                + args.lambda_rec0 * rec0_loss
+                + pred_loss
+                + args.lambda_cons * cons_loss
+                + args.lambda_balance * balance_loss
+                + args.lambda_entropy * entropy_loss
+            )
+
+            total["res"] += res_loss.item()
+            total["rec0"] += rec0_loss.item()
+            total["pred"] += pred_loss.item()
+            total["cons"] += cons_loss.item()
+            total["balance"] += balance_loss.item()
+            total["entropy"] += entropy_loss.item()
+            total["total"] += loss.item()
+            total["steps"] += 1
+
+    denom = max(1, total["steps"])
+    return {key: value / denom for key, value in total.items() if key != "steps"}
 
 
 def main():
@@ -131,57 +247,122 @@ def main():
         city_desc_dim=city_desc_dim,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_fn = torch.nn.SmoothL1Loss(reduction="none")
+    pred_loss_fn = torch.nn.L1Loss()
 
     best_val = float("inf")
     best_path = output_dir / "tapr_pretrain_best.pt"
     last_path = output_dir / "tapr_pretrain_last.pt"
 
     for epoch in range(1, args.epochs + 1):
+        args.current_epoch = epoch
+        pred_weight = get_pred_weight(epoch, args)
         model.train()
-        train_loss_sum = 0.0
-        train_count = 0
-        for x, _, _, city_ids in train_loader:
+        totals = {
+            "res": 0.0,
+            "rec0": 0.0,
+            "pred": 0.0,
+            "cons": 0.0,
+            "balance": 0.0,
+            "entropy": 0.0,
+            "total": 0.0,
+            "steps": 0,
+        }
+
+        for x, y, _, city_ids in train_loader:
             x = x.to(device)
+            y = y.to(device)
             city_desc = city_desc_table[city_ids.to(device)]
-            mask = sample_mask(x, args.mask_ratio, args.node_mask_ratio)
-            masked_x = apply_mask_token(x, mask, model.base.mask_token)
-            coarse, delta_hat, _ = model(masked_x, mae_mask=mask, city_desc=city_desc)
+            mask1 = sample_mask(x, args.mask_ratio, args.node_mask_ratio)
+            mask2 = sample_mask(x, args.mask_ratio, args.node_mask_ratio)
+            mask_f = mask1.float()
+
+            x_masked = apply_mask_token(x, mask1, model.base.mask_token)
+            coarse, delta_hat, _, z1, assignment1 = model(
+                x_masked,
+                mae_mask=mask1,
+                city_desc=city_desc,
+                return_assignment=True,
+            )
             gt_speed = x[..., 0]
             delta_target = gt_speed - coarse.detach()
-            loss = F.smooth_l1_loss(delta_hat[mask], delta_target[mask])
+            res_loss = (loss_fn(delta_hat, delta_target) * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+            rec0_loss = (loss_fn(coarse, gt_speed) * mask_f).sum() / mask_f.sum().clamp_min(1.0)
+
+            pred_loss = torch.zeros((), device=device)
+            if pred_weight > 0.0:
+                _, _, pred = model.base(x)
+                pred_loss = pred_loss_fn(pred, y) * pred_weight
+
+            x_masked2 = apply_mask_token(x, mask2, model.base.mask_token)
+            _, _, _, z2, assignment2 = model(
+                x_masked2,
+                mae_mask=mask2,
+                city_desc=city_desc,
+                return_assignment=True,
+            )
+            c1 = aggregate_prototype_tokens(z1, assignment1)
+            c2 = aggregate_prototype_tokens(z2, assignment2)
+            c1 = c1 / (c1.norm(dim=-1, keepdim=True) + 1e-6)
+            c2 = c2 / (c2.norm(dim=-1, keepdim=True) + 1e-6)
+            cons_loss = (1.0 - (c1 * c2).sum(dim=-1)).mean()
+            balance_loss, entropy_loss, usage_min, usage_max = prototype_usage_regularizer(assignment1)
+
+            loss = (
+                res_loss
+                + args.lambda_rec0 * rec0_loss
+                + pred_loss
+                + args.lambda_cons * cons_loss
+                + args.lambda_balance * balance_loss
+                + args.lambda_entropy * entropy_loss
+            )
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            train_loss_sum += loss.item()
-            train_count += 1
 
-        model.eval()
-        val_loss_sum = 0.0
-        val_count = 0
-        with torch.no_grad():
-            for x, _, _, city_ids in val_loader:
-                x = x.to(device)
-                city_desc = city_desc_table[city_ids.to(device)]
-                mask = sample_mask(x, args.mask_ratio, args.node_mask_ratio)
-                masked_x = apply_mask_token(x, mask, model.base.mask_token)
-                coarse, delta_hat, _ = model(masked_x, mae_mask=mask, city_desc=city_desc)
-                gt_speed = x[..., 0]
-                delta_target = gt_speed - coarse.detach()
-                loss = F.smooth_l1_loss(delta_hat[mask], delta_target[mask])
-                val_loss_sum += loss.item()
-                val_count += 1
+            totals["res"] += res_loss.item()
+            totals["rec0"] += rec0_loss.item()
+            totals["pred"] += pred_loss.item()
+            totals["cons"] += cons_loss.item()
+            totals["balance"] += balance_loss.item()
+            totals["entropy"] += entropy_loss.item()
+            totals["total"] += loss.item()
+            totals["steps"] += 1
 
-        avg_train = train_loss_sum / max(1, train_count)
-        avg_val = val_loss_sum / max(1, val_count)
-        logger.info("Epoch %d | train %.6f | val %.6f", epoch, avg_train, avg_val)
+        denom = max(1, totals["steps"])
+        train_stats = {key: value / denom for key, value in totals.items() if key != "steps"}
+        val_stats = evaluate(model, val_loader, city_desc_table, device, args)
+
+        logger.info(
+            "Epoch %d | lambda_pred %.4f | train total %.6f | val total %.6f | "
+            "train(res %.6f rec0 %.6f pred %.6f cons %.6f bal %.6f ent %.6f) | "
+            "val(res %.6f rec0 %.6f pred %.6f cons %.6f bal %.6f ent %.6f)",
+            epoch,
+            pred_weight,
+            train_stats["total"],
+            val_stats["total"],
+            train_stats["res"],
+            train_stats["rec0"],
+            train_stats["pred"],
+            train_stats["cons"],
+            train_stats["balance"],
+            train_stats["entropy"],
+            val_stats["res"],
+            val_stats["rec0"],
+            val_stats["pred"],
+            val_stats["cons"],
+            val_stats["balance"],
+            val_stats["entropy"],
+        )
+        logger.info("Epoch %d | usage min/max %.6f / %.6f", epoch, usage_min.item(), usage_max.item())
 
         torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch}, last_path)
-        if avg_val < best_val:
-            best_val = avg_val
+        if epoch > args.pred_warmup_epochs and val_stats["total"] < best_val:
+            best_val = val_stats["total"]
             torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch}, best_path)
             logger.info("Saved best checkpoint to %s", best_path)
 
 
 if __name__ == "__main__":
     main()
-

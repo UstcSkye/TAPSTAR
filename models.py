@@ -126,9 +126,7 @@ class BaseBranch(nn.Module):
 
         speed = history_data[..., 0]
         seasonal, trend = self.decomposition(speed, mask=mae_mask if return_reconstruction else None)
-        series_emb = (
-            self.time_series_seasonal(seasonal) + self.time_series_trend(trend)
-        ).unsqueeze(-1)
+        series_emb = (self.time_series_seasonal(seasonal) + self.time_series_trend(trend)).unsqueeze(-1)
 
         hidden = torch.cat([series_emb, tod_emb, dow_emb], dim=1)
         h = hidden.transpose(1, -1)
@@ -142,8 +140,7 @@ class BaseBranch(nn.Module):
         return h, z, prediction
 
     def residual_projection(self, hidden_tokens: torch.Tensor) -> torch.Tensor:
-        hidden = hidden_tokens.transpose(1, -1)
-        hidden = self.encoder(hidden)
+        hidden = self.encoder(hidden_tokens.transpose(1, -1))
         return hidden.transpose(1, -1)
 
 
@@ -186,7 +183,7 @@ class TAPR(nn.Module):
         q = self.value(input_tokens)
         q = torch.stack(torch.split(q, self.head_dim, dim=1), dim=1)
         logits = torch.einsum("hkd,bhdtn->bhktn", self.prototypes, q).transpose(-2, -3)
-        logits = logits / (self.head_dim**0.5)
+        logits = logits / (self.head_dim ** 0.5)
 
         if city_prompt is not None and self.prompt_to_bias is not None:
             bias = self.prompt_to_bias(city_prompt).view(b, 1, 1, self.num_prototypes, 1)
@@ -230,9 +227,7 @@ class TAPSTAR(nn.Module):
         super().__init__()
         self.base = BaseBranch(seq_len, horizon, num_layers, model_dim, prompt_dim, tod_size, kernel_size)
         self.use_city_prompt = use_city_prompt
-        self.city_prompt = (
-            CityPrompt(city_desc_dim, prompt_dim, city_prompt_hidden) if use_city_prompt else None
-        )
+        self.city_prompt = CityPrompt(city_desc_dim, prompt_dim, city_prompt_hidden) if use_city_prompt else None
         self.tapr = TAPR(self.base.hidden_dim, num_prototypes, num_heads, prompt_dim if use_city_prompt else 0)
         self.decoder = nn.Sequential(
             nn.Linear(self.base.hidden_dim, decoder_hidden_dim),
@@ -274,9 +269,7 @@ class TAPRPretrainer(nn.Module):
         super().__init__()
         self.base = BaseBranch(seq_len, seq_len, num_layers, model_dim, prompt_dim, tod_size, kernel_size)
         self.use_city_prompt = use_city_prompt
-        self.city_prompt = (
-            CityPrompt(city_desc_dim, prompt_dim, city_prompt_hidden) if use_city_prompt else None
-        )
+        self.city_prompt = CityPrompt(city_desc_dim, prompt_dim, city_prompt_hidden) if use_city_prompt else None
         self.tapr = TAPR(self.base.hidden_dim, num_prototypes, num_heads, prompt_dim if use_city_prompt else 0)
         self.residual_head = nn.Conv2d(self.base.hidden_dim, seq_len, kernel_size=(1, 1), bias=True)
 
@@ -285,16 +278,29 @@ class TAPRPretrainer(nn.Module):
             return None
         return self.city_prompt(city_desc)
 
+    def get_city_prompt(self, city_desc: torch.Tensor | None) -> torch.Tensor | None:
+        return self.encode_prompt(city_desc)
+
     def forward(
         self,
         history_data: torch.Tensor,
         mae_mask: torch.Tensor | None = None,
         city_desc: torch.Tensor | None = None,
+        return_assignment: bool = False,
     ):
         city_prompt = self.encode_prompt(city_desc)
-        _, z, _, _ = self.base(history_data, return_reconstruction=True, mae_mask=mae_mask)
-        coarse_reconstruction = self.base.reconstruction_head(z.transpose(1, -1)).squeeze(-1)
-        tapr_tokens = self.tapr(z, city_prompt=city_prompt)
+        _, z, _, coarse_reconstruction = self.base(
+            history_data,
+            return_reconstruction=True,
+            mae_mask=mae_mask,
+        )
+        if return_assignment:
+            tapr_tokens, assignment = self.tapr(z, city_prompt=city_prompt, return_assignment=True)
+        else:
+            tapr_tokens = self.tapr(z, city_prompt=city_prompt)
+            assignment = None
         delta_hat = self.residual_head(tapr_tokens.transpose(1, -1)).squeeze(-1)
         speed_hat = coarse_reconstruction + delta_hat
+        if return_assignment:
+            return coarse_reconstruction, delta_hat, speed_hat, z, assignment
         return coarse_reconstruction, delta_hat, speed_hat
